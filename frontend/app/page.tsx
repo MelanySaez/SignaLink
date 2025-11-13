@@ -70,9 +70,39 @@ export default function SignLanguageVideoCall() {
 
     // Cleanup al desmontar
     return () => {
+      console.log("🧹 Limpiando conexiones...")
+      
+      // Limpiar event listeners
+      socket.off("other-user")
+      socket.off("user-connected")
+      socket.off("offer")
+      socket.off("answer")
+      socket.off("ice-candidate")
+      socket.off("user-disconnected")
+      
       socket.close()
+      
+      // Limpiar peer connection si existe
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close()
+        peerConnectionRef.current = null
+      }
+      
+      // Detener streams locales
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => track.stop())
+        localStreamRef.current = null
+      }
     }
   }, [])
+
+  // Asegurar que el video local se actualice cuando cambie el stream
+  useEffect(() => {
+    if (localVideoRef.current && localStreamRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current
+      localVideoRef.current.play().catch(e => console.log("Auto-play:", e))
+    }
+  }, [isCallActive])
 
   // Crear conexión peer-to-peer
   const createPeerConnection = () => {
@@ -116,9 +146,23 @@ export default function SignLanguageVideoCall() {
     const socket = socketRef.current
     if (!socket) return
 
+    // Limpiar listeners anteriores para evitar duplicados
+    socket.off("other-user")
+    socket.off("user-connected")
+    socket.off("offer")
+    socket.off("answer")
+    socket.off("ice-candidate")
+    socket.off("user-disconnected")
+
     // Otro usuario ya está en la sala
     socket.on("other-user", async (userId: string) => {
       console.log("👤 Otro usuario detectado, creando oferta...")
+      
+      // Cerrar conexión anterior si existe
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close()
+      }
+      
       const pc = createPeerConnection()
       peerConnectionRef.current = pc
 
@@ -130,9 +174,13 @@ export default function SignLanguageVideoCall() {
       }
 
       // Crear y enviar oferta
-      const offer = await pc.createOffer()
-      await pc.setLocalDescription(offer)
-      socket.emit("offer", offer, roomId)
+      try {
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        socket.emit("offer", offer, roomId)
+      } catch (error) {
+        console.error("Error creando oferta:", error)
+      }
     })
 
     // Nuevo usuario se conectó
@@ -143,6 +191,12 @@ export default function SignLanguageVideoCall() {
     // Recibir oferta
     socket.on("offer", async (offer: RTCSessionDescriptionInit, userId: string) => {
       console.log("📥 Oferta recibida de:", userId)
+      
+      // Cerrar conexión anterior si existe
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close()
+      }
+      
       const pc = createPeerConnection()
       peerConnectionRef.current = pc
 
@@ -153,17 +207,25 @@ export default function SignLanguageVideoCall() {
         })
       }
 
-      await pc.setRemoteDescription(offer)
-      const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
-      socket.emit("answer", answer, roomId)
+      try {
+        await pc.setRemoteDescription(offer)
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        socket.emit("answer", answer, roomId)
+      } catch (error) {
+        console.error("Error procesando oferta:", error)
+      }
     })
 
     // Recibir respuesta
     socket.on("answer", async (answer: RTCSessionDescriptionInit, userId: string) => {
       console.log("📨 Respuesta recibida de:", userId)
       if (peerConnectionRef.current) {
-        await peerConnectionRef.current.setRemoteDescription(answer)
+        try {
+          await peerConnectionRef.current.setRemoteDescription(answer)
+        } catch (error) {
+          console.error("Error procesando respuesta:", error)
+        }
       }
     })
 
@@ -171,7 +233,11 @@ export default function SignLanguageVideoCall() {
     socket.on("ice-candidate", async (candidate: RTCIceCandidateInit, userId: string) => {
       console.log("🧊 ICE candidate recibido")
       if (peerConnectionRef.current) {
-        await peerConnectionRef.current.addIceCandidate(candidate)
+        try {
+          await peerConnectionRef.current.addIceCandidate(candidate)
+        } catch (error) {
+          console.error("Error añadiendo ICE candidate:", error)
+        }
       }
     })
 
@@ -181,6 +247,10 @@ export default function SignLanguageVideoCall() {
       setIsConnected(false)
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = null
+      }
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close()
+        peerConnectionRef.current = null
       }
     })
   }
@@ -195,12 +265,25 @@ export default function SignLanguageVideoCall() {
 
   const startCall = async () => {
     try {
+      console.log("🎥 Solicitando acceso a cámara y micrófono...")
+      
       // Obtener acceso a cámara y micrófono
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }, 
+        audio: true 
+      })
+      
+      console.log("✅ Acceso concedido, configurando stream local...")
       localStreamRef.current = stream
       
+      // Asignar stream al video local INMEDIATAMENTE
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream
+        // Forzar reproducción
+        localVideoRef.current.play().catch(e => console.log("Auto-play manejado:", e))
       }
       
       // Configurar listeners de Socket.io
@@ -208,16 +291,18 @@ export default function SignLanguageVideoCall() {
       
       // Unirse a la sala
       if (socketRef.current) {
-        socketRef.current.emit("join-room", roomId)
         console.log("🚪 Uniéndose a sala:", roomId)
+        socketRef.current.emit("join-room", roomId)
       }
       
       setIsCallActive(true)
       setIsMicEnabled(true)
       setIsCameraEnabled(true)
+      
+      console.log("🎉 Llamada iniciada correctamente")
     } catch (error) {
-      console.error("Error accessing camera/mic:", error)
-      alert("No se pudo acceder a la cámara o micrófono. Por favor, verifica los permisos.")
+      console.error("❌ Error accessing camera/mic:", error)
+      alert("No se pudo acceder a la cámara o micrófono. Por favor, verifica los permisos en la configuración del navegador.")
     }
   }
 
@@ -531,7 +616,26 @@ export default function SignLanguageVideoCall() {
             <div className="grid lg:grid-cols-2 gap-4 mb-6">
               {/* Local Video */}
               <div className="relative aspect-video rounded-2xl overflow-hidden bg-gray-900 border-2 border-gray-200">
-                <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+                <video 
+                  ref={localVideoRef} 
+                  autoPlay 
+                  playsInline 
+                  muted 
+                  className="w-full h-full object-cover"
+                  onLoadedMetadata={(e) => {
+                    // Asegurar que el video se reproduzca
+                    const video = e.currentTarget
+                    video.play().catch(err => console.log("Video auto-play:", err))
+                  }}
+                />
+                {!localStreamRef.current && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
+                    <div className="text-center text-white">
+                      <Video className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                      <p className="text-sm">Cargando cámara...</p>
+                    </div>
+                  </div>
+                )}
                 <div className="absolute top-4 left-4">
                   <Badge className="text-white gap-1.5" style={{ backgroundColor: "#0085B9" }}>
                     <div className="w-2 h-2 rounded-full bg-white animate-pulse" />
